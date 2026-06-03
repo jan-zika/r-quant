@@ -33,6 +33,11 @@ yarn-error.log*
 .pnpm-debug.log*
 *.local
 
+# Local working directories
+.working/
+.research/
+.colab/
+
 # OS
 .DS_Store
 Thumbs.db

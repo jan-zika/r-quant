@@ -1,0 +1,305 @@
+---
+title: "Agent Skill Demo: OCI Data Pipeline"
+author: "Jan Zika"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+---
+
+## Skill Name
+
+`oci-data-pipeline`
+
+## What Our Skill Does
+
+This skill instructs an AI agent to **scaffold and implement a complete data
+pipeline** backed by Oracle Cloud Infrastructure (OCI) Object Storage. When a
+developer says "set up OCI data pipeline," the agent creates everything needed
+so that:
+
+- **Data never lives in git** — it's too large, changes over time, or contains
+  derived artifacts that shouldn't clutter version history.
+- **Any consumer can get the exact same data** with a single function call
+  (`ensure_data()`), verified byte-for-byte via SHA-256 hashes.
+- **The maintainer** can update data from APIs, upload to OCI, and regenerate
+  the manifest — all with simple CLI commands.
+
+The pipeline has two sides:
+
+| Role | Who | Tool | Needs OCI SDK? |
+|------|-----|------|----------------|
+| **Maintainer** | Project owner | `scripts/oci_upload.py` | Yes |
+| **Consumer** | Teammates, graders, CI | `ensure_data()` | No — only the PAR URL |
+
+## Why We Chose This Topic
+
+Statistical analyses are only as reliable as their data. In practice, many
+student and research projects suffer from:
+
+1. **Irreproducible results** — someone runs an API call on Tuesday, gets
+   slightly different data than Monday, and their p-value changes.
+2. **"Works on my machine"** — the data lives on one person's laptop and
+   teammates can't run the analysis.
+3. **Repository bloat** — CSV files committed to git make cloning slow and
+   diffs unreadable.
+4. **Silent corruption** — a partially downloaded file passes a size check but
+   has wrong bytes, subtly biasing every statistical test downstream.
+
+This skill solves all four problems by establishing a **deterministic,
+hash-verified, cloud-backed data layer** as the foundation for any data
+project.
+
+## How the Skill Works
+
+The skill tells the agent to follow 9 steps:
+
+```{mermaid}
+%%| label: fig-pipeline-flow
+%%| fig-cap: "OCI Data Pipeline Architecture"
+flowchart TD
+    A["APIs"] -->|fetch| B["data/raw/"]
+    B -->|process| C["data/processed/"]
+    C -->|oci_upload.py| D[("OCI Bucket")]
+    D -->|generates| E["manifest.json"]
+
+    E -->|"git commit"| F["git clone"]
+    F -->|has| G["manifest.json"]
+    G -->|"ensure_data()"| D
+    D -->|"SHA-256 verify"| H["Local Cache"]
+```
+
+### The 9 Steps
+
+| Step | What the Agent Does |
+|------|---------------------|
+| 1 | **Detect project language** (R, Python, or mixed) |
+| 2 | **Create `data/` directory** with `raw/`, `processed/`, `_archive/` |
+| 3 | **Write `data/README.md`** documenting what lives where |
+| 4 | **Configure `.gitignore`** — ignore data, keep manifest |
+| 5 | **Create secrets template** (`.env.example` or `.Renviron.example`) |
+| 6 | **Create `scripts/oci_upload.py`** — maintainer upload tool |
+| 7 | **Create `ensure_data()`** — consumer download function |
+| 8 | **Create update/refresh tool** — for projects with API data |
+| 9 | **Initialize `oci_manifest.json`** — the committed contract |
+
+## Example Prompt
+
+> "Set up an OCI data pipeline for my R project. I'm pulling daily stock prices
+> from Yahoo Finance and FRED rates. The data should be cached locally and
+> backed up to OCI so my teammates can clone and run the analysis without
+> needing API keys."
+
+## Example Agent Response
+
+> I've set up a complete OCI data pipeline for your R project:
+>
+> **Files created:**
+>
+> - `data/README.md` — Documents your data layer (what's in git vs OCI vs
+>   local)
+> - `data/oci_manifest.json` — Empty manifest, ready for first upload
+> - `R/config.R` — Path helpers (`data_dir()`, `cache_dir()`, `raw_dir()`) and
+>   secret loaders (`fred_api_key()`, `oci_par_url()`)
+> - `R/cache.R` — Per-symbol CSV cache with atomic writes and date-based dedup
+> - `R/ensure_data.R` — Consumer function: downloads from OCI, verifies
+>   SHA-256
+> - `R/update_data.R` — Maintainer function: fetches from APIs, updates cache,
+>   optionally uploads to OCI
+> - `scripts/oci_upload.py` — Upload tool with `--dry-run`, `--force`,
+>   `--par-url`
+> - `.Renviron.example` — Template for `FRED_API_KEY` and `RLAB_OCI_PAR_URL`
+>
+> **`.gitignore` updated** to ignore `data/cache/`, `.Renviron`, `*.partial`
+> while keeping `data/oci_manifest.json` and `data/README.md` committed.
+>
+> **Next steps:**
+>
+> 1. Copy `.Renviron.example` → `.Renviron` and add your FRED API key
+> 2. Run `Rscript R/update_data.R --full` to fetch initial data
+> 3. Run `python scripts/oci_upload.py --par-url "<your PAR URL>"` to upload
+>    to OCI
+> 4. Commit `data/oci_manifest.json` — your teammates can now run
+>    `ensure_data()` to get the data
+
+## Skill in Action
+
+### The Manifest — The Committed Contract
+
+The `oci_manifest.json` is the single committed artifact that ties everything
+together. Here's what one looks like from a real project:
+
+```json
+{
+  "version": 1,
+  "par_url_env_var": "RLAB_OCI_PAR_URL",
+  "par_url_default": "https://objectstorage.us-ashburn-1.oraclecloud.com/p/.../o/",
+  "generated_at": "2026-06-01T18:30:00+00:00",
+  "files": [
+    {
+      "key": "raw/prices/XLK.csv",
+      "size": 105234,
+      "sha256": "a1b2c3d4e5f6..."
+    },
+    {
+      "key": "raw/prices/VTI.csv",
+      "size": 98712,
+      "sha256": "f6e5d4c3b2a1..."
+    },
+    {
+      "key": "processed/returns_long.csv",
+      "size": 245890,
+      "sha256": "1234abcd5678..."
+    }
+  ]
+}
+```
+
+Each entry has:
+
+- **`key`** — the path relative to the data directory (same as the OCI object
+  key)
+- **`size`** — exact file size in bytes (used for fast "already present?"
+  checks)
+- **`sha256`** — cryptographic hash of the file contents (used for integrity
+  verification after download)
+
+### Key Python Functions in `scripts/oci_upload.py`
+
+The upload script provides these core functions:
+
+```python
+def sha256_file(path: Path) -> str:
+    """Compute SHA-256 hex digest of a file.
+    Always reads in binary mode ('rb') with 64KB chunks.
+    This is critical: text-mode reads translate CRLF on Windows,
+    which silently changes the hash."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def collect_files(data_dir: Path) -> list[dict]:
+    """Walk data/ and collect uploadable files.
+    Skips: __pycache__, .DS_Store, oci_manifest.json, README.md.
+    Returns [{key, local_path, size}]."""
+
+
+def upload_files(entries, bucket_name, namespace, client,
+                 par_url, force=False) -> list[dict]:
+    """Upload to OCI, skipping files that already exist with
+    matching size (unless --force). Returns manifest entries."""
+
+
+def write_manifest(data_dir, manifest_files, par_url) -> Path:
+    """Write oci_manifest.json with version, par_url_env_var,
+    par_url_default, generated_at, and files list."""
+```
+
+### Key Consumer Functions in `ensure_data()`
+
+**Python version** (`src/<project>/data/fetch.py`):
+
+```python
+def ensure_data(data_dir=None, par_url=None,
+                force=False, quiet=False) -> Path:
+    """Download missing data files from OCI.
+    
+    PAR URL resolution: arg > env var > manifest default.
+    No OCI SDK needed — uses only urllib + the PAR URL.
+    
+    Each file is:
+    1. Downloaded to <path>.partial
+    2. SHA-256 verified against manifest
+    3. Renamed to final path (atomic-ish)
+    
+    Returns the data directory path."""
+```
+
+**R version** (`R/ensure_data.R`):
+
+```r
+ensure_data <- function(par_url = NULL, force = FALSE, quiet = FALSE) {
+  # Reads data/oci_manifest.json
+  # For each file: check local size → download if missing → verify SHA-256
+  # Uses openssl::sha256() with readBin() (binary mode — critical on Windows)
+  # Atomic write: download to .partial, rename after hash check
+}
+```
+
+### Data Update Workflow
+
+For projects with API data sources, the skill also creates an update tool:
+
+**`Rscript R/update_data.R [--full] [--upload]`**
+
+1. Read `config/symbols.yml` (symbol universe)
+2. For each symbol:
+   - Check `last_cached_date()` in local CSV
+   - Fetch only **new** dates from API (incremental)
+   - Or re-fetch **all** dates if `--full` (re-baseline)
+   - Merge into local cache (dedup on date, new rows win)
+3. Build processed artifacts (`returns_long.csv`, etc.)
+4. If `--upload`: shell out to `scripts/oci_upload.py`
+5. Remind: `git add data/oci_manifest.json && git commit`
+
+### `.gitignore` Configuration
+
+The skill ensures the `.gitignore` properly separates committed metadata from
+gitignored data:
+
+```gitignore
+# Data files — hosted on OCI, never committed
+data/raw/
+data/processed/
+data/cache/
+data/_archive/
+*.partial
+
+# KEEP these committed (negative ignores)
+!data/oci_manifest.json
+!data/README.md
+
+# Secrets — never committed
+.env
+.Renviron
+```
+
+## Group Reflection
+
+1. **What did your group create?**
+   An agent skill that scaffolds a complete OCI Object Storage data pipeline —
+   including directory structure, upload scripts, download/verify functions,
+   secrets management, and `.gitignore` configuration — for any R or Python
+   data project.
+
+2. **How does this connect to statistics?**
+   Statistical reproducibility requires identical data inputs. This skill
+   ensures that every consumer of a project gets byte-identical data files,
+   verified by SHA-256 hashes, from a cloud-backed cache. It prevents API
+   drift (where live API calls return different data on different days),
+   eliminates "works on my machine" data issues, and creates an auditable
+   record (via the committed manifest) of exactly which data was used for any
+   analysis.
+
+3. **What mistake does your skill help prevent?**
+   The most dangerous mistake is running statistical tests on
+   **non-deterministic data** — data that changes between runs because it comes
+   from a live API, or data that's silently corrupted during download. A
+   researcher might get p = 0.04 on Monday and p = 0.06 on Tuesday, with no
+   way to know which (if either) is correct. This skill forces all analysis to
+   run on a fixed, verified snapshot.
+
+4. **How could this skill help someone understand data better?**
+   By separating data *collection* from data *analysis*, it forces the
+   researcher to think explicitly about what their data snapshot represents:
+   which time window, which symbols, which API version. The manifest becomes
+   documentation of the data itself. And the update/refresh workflow makes it
+   clear that data is not static — it has a lifecycle of collection, caching,
+   verification, and versioning.

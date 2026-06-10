@@ -8,6 +8,9 @@
 *.tar.gz
 *.tgz
 
+# Secrets / local environment
+.Renviron
+
 # renv
 renv/library/
 renv/staging/

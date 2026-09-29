@@ -1,0 +1,9 @@
+# Copy this file to .Renviron (gitignored) and fill in your keys, then restart R.
+#
+# FRED_API_KEY is required for the macro / risk-free series.
+# Get a free key at https://fred.stlouisfed.org/docs/api/api_key.html
+FRED_API_KEY=your_fred_api_key_here
+
+# TIINGO_API_KEY is optional. When set, prices come from Tiingo's adjusted EOD;
+# otherwise the pipeline falls back to the keyless Yahoo / Stooq sources.
+# TIINGO_API_KEY=your_tiingo_key_here

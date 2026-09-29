@@ -1,0 +1,360 @@
+---
+title: "Multiple Linear Regression: A Macro-Augmented Factor Model of NVIDIA's Daily Returns"
+author: "Jan Zika"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+  pdf:
+    toc: true
+    number-sections: true
+    fig-width: 7
+    fig-height: 4.5
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+```{r setup}
+#| include: false
+# Source the data pipeline (fetched from the FRED + market-price APIs) and load
+# the processed panels it writes to data/cache/processed/.
+repo <- normalizePath(file.path(getwd(), "..", ".."), mustWork = FALSE)
+if (!file.exists(file.path(repo, "config", "symbols.yml"))) repo <- getwd()
+knitr::opts_knit$set(root.dir = repo)
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(ggplot2)
+  library(broom); library(car); library(lmtest); library(knitr)
+})
+
+source(file.path(repo, "R", "config.R"))
+
+prices_wide <- readr::read_csv(file.path(processed_dir(), "prices_wide.csv"),
+                               show_col_types = FALSE)
+macro_wide  <- readr::read_csv(file.path(processed_dir(), "macro_wide.csv"),
+                               show_col_types = FALSE)
+```
+
+```{r build-model}
+#| include: false
+# --- Daily simple returns from the adjusted-close panel ---
+rets <- prices_wide |> arrange(date)
+ret_cols <- setdiff(names(rets), "date")
+for (cc in ret_cols) rets[[cc]] <- rets[[cc]] / dplyr::lag(rets[[cc]]) - 1
+rets <- rets[-1, ]
+
+# --- Macro factors from the FRED panel ---
+# DTB3 -> daily risk-free rate; spreads and VIX entered as daily first
+# differences so each predictor is a stationary daily change, matched to returns.
+macro <- macro_wide |> arrange(date) |>
+  mutate(
+    rf_daily = (DTB3 / 100) / 252,
+    d_term   = T10Y3M - dplyr::lag(T10Y3M),
+    d_credit = BAA10Y - dplyr::lag(BAA10Y),
+    d_vix    = VIXCLS - dplyr::lag(VIXCLS)
+  ) |>
+  select(date, rf_daily, d_term, d_credit, d_vix)
+
+# --- Assemble the model frame: one row per trading day ---
+model_df <- rets |>
+  inner_join(macro, by = "date") |>
+  mutate(
+    NVDA_excess  = NVDA - rf_daily,   # outcome: NVIDIA daily excess return
+    Market       = VTI - rf_daily,    # market excess return (the CAPM term)
+    Size         = IWM - SPY,         # small-cap minus large-cap
+    Value        = IWD - IWF,         # value minus growth
+    Sector       = XSD - VTI,         # semiconductor tilt over the market
+    TermSpread   = d_term,            # daily change in the 10Y-3M yield slope
+    CreditSpread = d_credit,          # daily change in the Baa-10Y credit spread
+    Volatility   = d_vix              # daily change in the VIX
+  ) |>
+  select(date, NVDA_excess, Market, Size, Value, Sector,
+         TermSpread, CreditSpread, Volatility) |>
+  tidyr::drop_na()
+
+model <- lm(NVDA_excess ~ Market + Size + Value + Sector +
+              TermSpread + CreditSpread + Volatility, data = model_df)
+
+s   <- summary(model)
+co  <- coef(model)
+n_obs <- nrow(model_df)
+date_min <- format(min(model_df$date)); date_max <- format(max(model_df$date))
+fmt <- function(x, d = 4) formatC(x, format = "f", digits = d)
+```
+
+## Research Question
+
+**Which broad market, style, sector, and macroeconomic forces move NVIDIA's daily
+stock return, and how much of that return do they jointly explain?**
+
+NVIDIA (NVDA) is one of the most heavily traded stocks in the market, and its
+day-to-day moves are widely treated as a barometer for the technology and
+semiconductor sectors. This analysis asks how much of NVIDIA's daily return is
+*systematic* — driven by forces that move the whole market — versus
+*idiosyncratic* — specific to the company itself. The answer matters to anyone
+holding or hedging the stock: it tells them what NVIDIA is really exposed to, and
+how much of its risk could in principle be diversified or hedged away.
+
+The outcome is NVIDIA's daily **excess return** (its return above the risk-free
+rate). The seven predictors span the market itself, two investment *style*
+factors (size and value), a *sector* factor, and three *macroeconomic* signals
+(the yield-curve slope, the corporate credit spread, and market-wide volatility).
+
+## Dataset and Variables
+
+**Source.** All data is pulled programmatically through public market-data APIs.
+Daily adjusted closing prices come from a market-price API; the macroeconomic and
+interest-rate series come from the U.S. Federal Reserve's FRED API. A small R
+pipeline (`R/update_data.R`) fetches every series, caches it, and assembles the
+clean daily panel used here.
+
+**What each row represents.** One **trading day**. Each row pairs NVIDIA's return
+for that day with the value of every market, style, sector, and macro factor on
+the same day.
+
+**Number of observations.** The model is estimated on **`r n_obs` trading days**,
+spanning **`r date_min`** to **`r date_max`**.
+
+**Variables.**
+
+| Role | Variable | What it represents |
+|------|----------|--------------------|
+| Outcome | **NVDA excess return** | NVIDIA's daily return minus the risk-free rate. |
+| Predictor 1 | **Market** | The total stock market's excess return (a broad-market ETF minus the risk-free rate). This is the classic CAPM market factor. |
+| Predictor 2 | **Size** | Small-cap return minus large-cap return. Positive when smaller companies outperform. |
+| Predictor 3 | **Value** | Value-stock return minus growth-stock return. Positive when cheap "value" stocks beat fast-growing "growth" stocks. |
+| Predictor 4 | **Sector** | The semiconductor sector's return above the market. Captures chip-industry-specific moves. |
+| Predictor 5 | **TermSpread** | The daily change in the 10-year-minus-3-month Treasury yield slope. A rising slope often signals improving growth expectations. |
+| Predictor 6 | **CreditSpread** | The daily change in the Baa-corporate-minus-10-year-Treasury yield spread. A rising spread signals growing financial stress. |
+| Predictor 7 | **Volatility** | The daily change in the VIX, the market's "fear gauge." |
+
+The risk-free rate is the 3-month Treasury bill rate. The spreads and the VIX
+enter as **daily changes** rather than levels, so each predictor is a stationary
+daily signal that lines up naturally with a daily return.
+
+## The Regression Model Equation
+
+The general form of a multiple linear regression with seven predictors is:
+
+$$
+Y = \beta_0 + \beta_1 X_1 + \beta_2 X_2 + \beta_3 X_3 + \beta_4 X_4
+      + \beta_5 X_5 + \beta_6 X_6 + \beta_7 X_7 + \varepsilon
+$$
+
+where $Y$ is the outcome, $\beta_0$ is the intercept, each $\beta_k$ is the
+coefficient on predictor $X_k$, and $\varepsilon$ is the error term. Written with
+our own variable names:
+
+$$
+\text{NVDA excess} = \beta_0 + \beta_1\,\text{Market} + \beta_2\,\text{Size}
+  + \beta_3\,\text{Value} + \beta_4\,\text{Sector}
+  + \beta_5\,\text{TermSpread} + \beta_6\,\text{CreditSpread}
+  + \beta_7\,\text{Volatility} + \varepsilon
+$$
+
+After fitting the model, the estimated equation (using the actual coefficients
+computed below) is:
+
+$$
+\widehat{\text{NVDA excess}} = `r fmt(co[1])`
+  + `r fmt(co[2])`\,\text{Market}
+  `r fmt(co[3])`\,\text{Size}
+  `r fmt(co[4])`\,\text{Value}
+  + `r fmt(co[5])`\,\text{Sector}
+  + `r fmt(co[6])`\,\text{TermSpread}
+  `r fmt(co[7])`\,\text{CreditSpread}
+  + `r fmt(co[8])`\,\text{Volatility}
+$$
+
+## Running the Model in R
+
+```{r run-model}
+#| code-fold: false
+model <- lm(NVDA_excess ~ Market + Size + Value + Sector +
+              TermSpread + CreditSpread + Volatility, data = model_df)
+summary(model)
+```
+
+```{r coef-table}
+broom::tidy(model) |>
+  mutate(across(where(is.numeric), \(x) round(x, 5))) |>
+  kable(caption = "Estimated coefficients, standard errors, t-statistics, and p-values.")
+```
+
+## Interpreting the Model Summary
+
+### A. Coefficients
+
+Each coefficient is the average change in NVIDIA's daily excess return associated
+with a one-unit increase in that predictor, **holding the other six predictors
+constant**.
+
+- **Market (`r fmt(co["Market"])`).** Positive. When the market's excess return
+  rises by one unit, NVIDIA's expected excess return rises by about
+  `r fmt(co["Market"])`. A value above 1 means NVIDIA is a **high-beta** stock: it
+  amplifies market moves, climbing more than the market in up days and falling
+  more in down days.
+- **Size (`r fmt(co["Size"])`).** Negative. When small-cap stocks beat large-caps,
+  NVIDIA tends to lag slightly — consistent with NVIDIA trading like a large-cap.
+- **Value (`r fmt(co["Value"])`).** Strongly negative. When value stocks beat
+  growth stocks, NVIDIA falls. This is the model's clearest style signal: NVIDIA
+  behaves like a **growth** stock, moving opposite to the value-minus-growth factor.
+- **Sector (`r fmt(co["Sector"])`).** Positive. Independent of the broad market,
+  when semiconductors outperform, NVIDIA rises with its sector — exactly what we
+  expect from a chip maker.
+- **TermSpread (`r fmt(co["TermSpread"])`).** Small. A one-day steepening of the
+  yield curve has little measured association with NVIDIA's return once the other
+  factors are held constant.
+- **CreditSpread (`r fmt(co["CreditSpread"])`).** Negative. On days when the
+  corporate credit spread widens — a sign of rising financial stress — NVIDIA
+  tends to fall, even after accounting for the market.
+- **Volatility (`r fmt(co["Volatility"])`).** Very small once the market factor is
+  in the model, because changes in the VIX and market returns carry overlapping
+  information.
+
+### B. P-values
+
+```{r pvals}
+broom::tidy(model) |>
+  transmute(term, estimate = round(estimate, 5), p.value = signif(p.value, 3),
+            significant_5pct = ifelse(p.value < 0.05, "yes", "no")) |>
+  kable(caption = "Which predictors show statistically significant relationships.")
+```
+
+A small p-value is evidence that a predictor's true coefficient is different from
+zero. The **market, size, value, and sector** factors are all highly significant
+(p-values far below 0.05): the data give strong evidence that each is genuinely
+related to NVIDIA's return. The **credit spread** is significant at the 5% level,
+showing measurable sensitivity to financial-stress days. By contrast, the **term
+spread** and the **change in the VIX** are *not* statistically significant: once
+the market and sector factors are present, these two macro signals add no
+detectable independent relationship with NVIDIA's daily return. A non-significant
+predictor does not prove there is no relationship — only that this data set shows
+no clear evidence of one.
+
+### C. R-squared
+
+The R-squared value is **`r fmt(s$r.squared, 3)`**, which means the model explains
+approximately **`r round(100 * s$r.squared)`%** of the day-to-day variation in
+NVIDIA's excess return. In other words, roughly that share of NVIDIA's daily moves
+is *systematic* — traceable to broad market, style, sector, and macro forces —
+while the remaining **`r round(100 * (1 - s$r.squared))`%** is **idiosyncratic**:
+specific to NVIDIA (company news, earnings, product announcements) and not
+captured by these factors.
+
+### D. Adjusted R-squared
+
+The adjusted R-squared is **`r fmt(s$adj.r.squared, 3)`**. Adjusted R-squared
+penalizes the model for each extra predictor, so it only rises when a new variable
+earns its place. Here it is almost identical to the ordinary R-squared
+(`r fmt(s$r.squared, 3)`), telling us the seven predictors together are not
+padding the model with noise — the explanatory power is real and not an artifact
+of simply adding variables. The fact that the two values barely differ is a sign
+of a healthy, well-specified model.
+
+## Residual Errors and Model Fit
+
+A **residual** is the difference between the actual value and the model's
+prediction:
+
+$$\text{Residual} = \text{Actual} - \text{Predicted}$$
+
+A residual tells us how far off the model was on a single day. A **positive**
+residual means the model **underpredicted** (NVIDIA did better than expected); a
+**negative** residual means it **overpredicted** (NVIDIA did worse than expected).
+For example, if NVIDIA's actual excess return on a day was 3% and the model
+predicted 2%, the residual is +1%.
+
+## Residual Plot
+
+```{r resid-plot}
+#| fig-cap: "Residuals versus fitted values. A random horizontal band around zero indicates a well-behaved linear model."
+model_df$predicted <- fitted(model)
+model_df$residuals <- residuals(model)
+
+ggplot(model_df, aes(x = predicted, y = residuals)) +
+  geom_point(alpha = 0.25, color = "#2c7fb8") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(se = FALSE, color = "#d95f02", linewidth = 0.7) +
+  labs(title = "Residuals vs. Predicted Values (NVIDIA excess return)",
+       x = "Predicted excess return", y = "Residual") +
+  theme_minimal()
+```
+
+```{r diagnostic-plots}
+#| fig-cap: "Standard regression diagnostics: residuals vs fitted, Normal Q-Q, scale-location, and residuals vs leverage."
+par(mfrow = c(2, 2)); plot(model); par(mfrow = c(1, 1))
+```
+
+The residuals are scattered fairly evenly above and below zero with no obvious
+trend across the range of predictions, so the orange smoother stays close to the
+dashed zero line — the **linearity** assumption looks reasonable. The visible
+feature is that the *spread* of the residuals widens on high-volatility days:
+large surprises cluster together, a familiar property of stock returns. The model
+does not systematically over- or under-predict in any region; its errors are
+roughly centered on zero everywhere, but it is least precise during turbulent
+market periods. The Q-Q plot shows heavier tails than a normal distribution —
+extreme days (large jumps) happen more often than a bell curve would predict.
+
+## Model Assumptions and Limitations
+
+```{r diagnostics}
+vif_vals <- car::vif(model)
+bp <- lmtest::bptest(model)
+dw_lag1 <- cor(head(residuals(model), -1), tail(residuals(model), -1))
+```
+
+- **Linearity.** The residual plot shows no strong curvature, so a straight-line
+  relationship between the factors and NVIDIA's return is a defensible
+  approximation.
+- **Residual randomness / independence.** The day-to-day autocorrelation of the
+  residuals is only about `r fmt(dw_lag1, 3)`, essentially zero, so the model is
+  not leaving obvious predictable structure in its errors.
+- **Outliers.** Extreme trading days (earnings surprises, market shocks) appear in
+  the tails of the Q-Q plot. They do not dominate the fit given the large sample,
+  but they are the days the model predicts least well.
+- **Multicollinearity.** All variance-inflation factors are low (the largest is
+  about `r fmt(max(vif_vals), 1)`, well under the usual threshold of 5), so the
+  predictors are not redundant and each coefficient is estimated on its own
+  distinct information.
+- **Constant error variance.** A Breusch–Pagan test rejects constant variance
+  (p `r ifelse(bp$p.value < 0.001, "< 0.001", paste("=", fmt(bp$p.value, 3)))`):
+  the model's errors are larger on volatile days. This **heteroskedasticity** does
+  not bias the coefficients, but it means the reported standard errors slightly
+  overstate the precision of the estimates. The large significances here are wide
+  enough that this caveat does not change which factors matter.
+- **Causation.** This model shows **association, not causation**. A significant
+  coefficient means a factor *moves together with* NVIDIA's return, not that it
+  *causes* it. These factors and NVIDIA are all driven by the same underlying
+  market forces in real time.
+
+## The "So What?"
+
+This model turns a noisy stream of daily NVIDIA returns into a clear story.
+About **`r round(100 * s$r.squared)`%** of NVIDIA's daily movement is **systematic**
+— explained by where the broad market, growth-versus-value sentiment, and the
+semiconductor sector went that day. The single most important driver is the
+**market itself**: with a beta of `r fmt(co["Market"], 2)`, NVIDIA amplifies
+market moves, so it is a high-risk, high-reward holding rather than a defensive
+one. Its strong **growth** tilt (the large negative Value coefficient) and its
+clear **semiconductor** loading confirm what investors intuit — NVIDIA lives or
+dies with growth-stock sentiment and the chip cycle. The significant **credit
+spread** effect adds that NVIDIA also feels broad financial stress.
+
+The practical takeaways: an investor who already owns the market and the
+semiconductor sector is, to a large degree, *already* holding NVIDIA's risk —
+which is useful for hedging and diversification decisions. But the remaining
+**`r round(100 * (1 - s$r.squared))`%** of NVIDIA's daily variation is
+**idiosyncratic** and cannot be explained by these broad factors; it is the part
+driven by company-specific news. Anyone using this model should remember three
+things: it explains *association*, not cause; it is least reliable precisely on
+the most turbulent days; and it describes the average relationship over this
+sample, which can shift as market regimes change. It is a strong tool for
+*understanding* what NVIDIA is exposed to — not a crystal ball for predicting
+tomorrow's price.

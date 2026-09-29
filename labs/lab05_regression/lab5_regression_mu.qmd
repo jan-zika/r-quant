@@ -1,0 +1,620 @@
+---
+title: "Multiple Linear Regression: A Macro-Augmented Factor Model of Micron's Daily Returns"
+author: "Jan Zika"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+  pdf:
+    toc: true
+    number-sections: true
+    fig-width: 7
+    fig-height: 4.5
+    include-in-header:
+      text: |
+        \usepackage{fvextra}
+        \fvset{breaklines,breaknonspaceingroup,breaksymbolleft={}}
+        \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,breaknonspaceingroup,breaksymbolleft={},commandchars=\\\{\}}
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+```{r setup}
+#| include: false
+# Source the data pipeline (fetched from the FRED + market-price APIs) and load
+# the processed panels it writes to data/cache/processed/.
+repo <- normalizePath(file.path(getwd(), "..", ".."), mustWork = FALSE)
+if (!file.exists(file.path(repo, "config", "symbols.yml"))) repo <- getwd()
+knitr::opts_knit$set(root.dir = repo)
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(ggplot2)
+  library(broom); library(car); library(lmtest); library(knitr)
+  library(strucchange); library(sandwich); library(zoo)
+})
+
+source(file.path(repo, "R", "config.R"))
+
+prices_wide <- readr::read_csv(file.path(processed_dir(), "prices_wide.csv"),
+                               show_col_types = FALSE)
+macro_wide  <- readr::read_csv(file.path(processed_dir(), "macro_wide.csv"),
+                               show_col_types = FALSE)
+```
+
+```{r build-model}
+#| include: false
+# --- Daily simple returns from the adjusted-close panel ---
+rets <- prices_wide |> arrange(date)
+ret_cols <- setdiff(names(rets), "date")
+for (cc in ret_cols) rets[[cc]] <- rets[[cc]] / dplyr::lag(rets[[cc]]) - 1
+rets <- rets[-1, ]
+
+# --- Macro factors from the FRED panel ---
+# DTB3 -> daily risk-free rate; spreads and VIX entered as daily first
+# differences so each predictor is a stationary daily change, matched to returns.
+macro <- macro_wide |> arrange(date) |>
+  mutate(
+    rf_daily = (DTB3 / 100) / 252,
+    d_term   = T10Y3M - dplyr::lag(T10Y3M),
+    d_credit = BAA10Y - dplyr::lag(BAA10Y),
+    d_vix    = VIXCLS - dplyr::lag(VIXCLS)
+  ) |>
+  select(date, rf_daily, d_term, d_credit, d_vix)
+
+# --- Assemble the model frame: one row per trading day ---
+model_df <- rets |>
+  inner_join(macro, by = "date") |>
+  mutate(
+    MU_excess    = MU - rf_daily,     # outcome: Micron daily excess return
+    Market       = VTI - rf_daily,    # market excess return (the CAPM term)
+    Size         = IWM - SPY,         # small-cap minus large-cap
+    Value        = IWD - IWF,         # value minus growth
+    Sector       = XSD - VTI,         # semiconductor tilt over the market
+    TermSpread   = d_term,            # daily change in the 10Y-3M yield slope
+    CreditSpread = d_credit,          # daily change in the Baa-10Y credit spread
+    Volatility   = d_vix,             # daily change in the VIX
+    NVDA_ret     = NVDA               # NVIDIA daily return (AI-demand bellwether)
+  ) |>
+  select(date, MU_excess, Market, Size, Value, Sector,
+         TermSpread, CreditSpread, Volatility, NVDA_ret) |>
+  tidyr::drop_na()
+
+model <- lm(MU_excess ~ Market + Size + Value + Sector +
+              TermSpread + CreditSpread + Volatility, data = model_df)
+
+s   <- summary(model)
+co  <- coef(model)
+n_obs <- nrow(model_df)
+date_min <- format(min(model_df$date)); date_max <- format(max(model_df$date))
+fmt <- function(x, d = 4) formatC(x, format = "f", digits = d)
+```
+
+## Research Question
+
+**Which broad market, style, sector, and macroeconomic forces move Micron's daily
+stock return, and how much of that return do they jointly explain?**
+
+Micron Technology (MU) is the leading U.S. maker of memory chips — the DRAM and
+NAND that go into everything from data-center accelerators to phones — and its
+moves are watched closely as a read on the memory cycle and on demand for
+AI-driven computing. This analysis asks how much of Micron's daily return is
+*systematic* — driven by forces that move the whole market — versus
+*idiosyncratic* — specific to the company itself. The answer matters to anyone
+holding or hedging the stock: it tells them what Micron is really exposed to, and
+how much of its risk could in principle be diversified or hedged away.
+
+The outcome is Micron's daily **excess return** (its return above the risk-free
+rate). The seven predictors span the market itself, two investment *style*
+factors (size and value), a *sector* factor, and three *macroeconomic* signals
+(the yield-curve slope, the corporate credit spread, and market-wide volatility).
+
+## Dataset and Variables
+
+**Source.** All data is pulled programmatically through public market-data APIs.
+Daily adjusted closing prices come from a market-price API; the macroeconomic and
+interest-rate series come from the U.S. Federal Reserve's FRED API. A small R
+pipeline (`R/update_data.R`) fetches every series, caches it, and assembles the
+clean daily panel used here.
+
+**What each row represents.** One **trading day**. Each row pairs Micron's return
+for that day with the value of every market, style, sector, and macro factor on
+the same day.
+
+**Number of observations.** The model is estimated on **`r n_obs` trading days**,
+spanning **`r date_min`** to **`r date_max`**.
+
+**Variables.**
+
+| Role | Variable | What it represents |
+|------|----------|--------------------|
+| Outcome | **MU excess return** | Micron's daily return minus the risk-free rate. |
+| Predictor 1 | **Market** | The total stock market's excess return (a broad-market ETF minus the risk-free rate). This is the classic CAPM market factor. |
+| Predictor 2 | **Size** | Small-cap return minus large-cap return. Positive when smaller companies outperform. |
+| Predictor 3 | **Value** | Value-stock return minus growth-stock return. Positive when cheap "value" stocks beat fast-growing "growth" stocks. |
+| Predictor 4 | **Sector** | The semiconductor sector's return above the market. Captures chip-industry-specific moves. |
+| Predictor 5 | **TermSpread** | The daily change in the 10-year-minus-3-month Treasury yield slope. A rising slope often signals improving growth expectations. |
+| Predictor 6 | **CreditSpread** | The daily change in the Baa-corporate-minus-10-year-Treasury yield spread. A rising spread signals growing financial stress. |
+| Predictor 7 | **Volatility** | The daily change in the VIX, the market's "fear gauge." |
+
+The risk-free rate is the 3-month Treasury bill rate. The spreads and the VIX
+enter as **daily changes** rather than levels, so each predictor is a stationary
+daily signal that lines up naturally with a daily return.
+
+## The Regression Model Equation
+
+The general form of a multiple linear regression with seven predictors is:
+
+$$
+Y = \beta_0 + \beta_1 X_1 + \beta_2 X_2 + \beta_3 X_3 + \beta_4 X_4
+      + \beta_5 X_5 + \beta_6 X_6 + \beta_7 X_7 + \varepsilon
+$$
+
+where $Y$ is the outcome, $\beta_0$ is the intercept, each $\beta_k$ is the
+coefficient on predictor $X_k$, and $\varepsilon$ is the error term. Written with
+our own variable names:
+
+$$
+\begin{aligned}
+\text{MU excess} = {} & \beta_0 + \beta_1\,\text{Market} + \beta_2\,\text{Size}
+  + \beta_3\,\text{Value} + \beta_4\,\text{Sector} \\
+  & + \beta_5\,\text{TermSpread} + \beta_6\,\text{CreditSpread}
+  + \beta_7\,\text{Volatility} + \varepsilon
+\end{aligned}
+$$
+
+After fitting the model, the estimated equation (using the actual coefficients
+computed below) is:
+
+$$
+\begin{aligned}
+\widehat{\text{MU excess}} = {} & `r fmt(co[1])`
+  + `r fmt(co[2])`\,\text{Market}
+  `r fmt(co[3])`\,\text{Size}
+  + `r fmt(co[4])`\,\text{Value}
+  + `r fmt(co[5])`\,\text{Sector} \\
+  & + `r fmt(co[6])`\,\text{TermSpread}
+  `r fmt(co[7])`\,\text{CreditSpread}
+  `r fmt(co[8])`\,\text{Volatility}
+\end{aligned}
+$$
+
+## Running the Model in R
+
+```{r run-model}
+#| code-fold: false
+model <- lm(MU_excess ~ Market + Size + Value + Sector +
+              TermSpread + CreditSpread + Volatility, data = model_df)
+summary(model)
+```
+
+```{r coef-table}
+broom::tidy(model) |>
+  mutate(across(where(is.numeric), \(x) round(x, 5))) |>
+  kable(caption = "Estimated coefficients, standard errors, t-statistics, and p-values.")
+```
+
+## Interpreting the Model Summary
+
+### A. Coefficients
+
+Each coefficient is the average change in Micron's daily excess return associated
+with a one-unit increase in that predictor, **holding the other six predictors
+constant**.
+
+- **Intercept (`r fmt(co["(Intercept)"])`).** In an excess-return factor model the
+  intercept is the model's **alpha**: the average daily return Micron earns *beyond*
+  what its factor exposures explain. Here it is tiny — about
+  `r fmt(100 * co["(Intercept)"], 3)`% per day — and statistically indistinguishable
+  from zero. This is the expected result: once the market, sector, and style factors
+  are accounted for, Micron shows no systematic leftover drift, so the explanatory
+  work is done by the factors rather than by an unexplained constant.
+- **Market (`r fmt(co["Market"])`).** Positive and modestly above one. Holding the
+  other predictors constant, a one-unit increase in the market's excess return is
+  associated with an increase of about `r fmt(co["Market"])` in Micron's expected
+  excess return. A loading above one means Micron amplifies market moves, but at
+  `r fmt(co["Market"], 2)` over the full sample the amplification is slight. This is
+  a sample average; the structural-break analysis below shows the market loading
+  rose in the post-2024 regime.
+- **Size (`r fmt(co["Size"])`).** Negative. When small-cap stocks beat large-caps,
+  Micron tends to lag slightly — consistent with Micron trading like a large-cap.
+- **Value (`r fmt(co["Value"])`).** Positive. When value stocks beat growth stocks,
+  Micron tends to *rise*. Unlike the pure megacap growth names, Micron carries a
+  modest **value** tilt — fitting for a capital-intensive, cyclical memory
+  manufacturer whose earnings swing with the commodity-like price of chips rather
+  than with a smooth growth narrative.
+- **Sector (`r fmt(co["Sector"])`).** Strongly positive and the largest loading in
+  the model. Independent of the broad market, a one-unit increase in the
+  semiconductor sector's excess return is associated with a roughly one-for-one
+  increase in Micron's return, indicating that the chip sector is its dominant
+  systematic exposure.
+- **TermSpread (`r fmt(co["TermSpread"])`).** A one-day steepening of the yield
+  curve carries a small positive association with Micron's return, consistent with
+  a cyclical name that benefits when the market prices in stronger growth.
+- **CreditSpread (`r fmt(co["CreditSpread"])`).** Negative. On days when the
+  corporate credit spread widens — a sign of rising financial stress — Micron
+  tends to fall, even after accounting for the market.
+- **Volatility (`r fmt(co["Volatility"])`).** Very small once the market factor is
+  in the model, because changes in the VIX and market returns carry overlapping
+  information.
+
+### B. P-values
+
+```{r pvals}
+broom::tidy(model) |>
+  transmute(term, estimate = round(estimate, 5), p.value = signif(p.value, 3),
+            significant_5pct = ifelse(p.value < 0.05, "yes", "no")) |>
+  kable(caption = "Which predictors show statistically significant relationships.")
+```
+
+A small p-value is evidence that a predictor's true coefficient is different from
+zero. The **market, size, value, sector, and term-spread** factors are all
+significant at the 5% level: the data give strong evidence that each is genuinely
+related to Micron's return, and the **sector** and **market** loadings in
+particular are estimated with overwhelming confidence. By contrast, the **credit
+spread** and the **change in the VIX** are *not* statistically significant for
+Micron: once the market and sector factors are present, these two add no
+detectable independent relationship with Micron's daily return. A non-significant
+predictor does not prove there is no relationship — only that this data set shows
+no clear evidence of one.
+
+The **intercept** is likewise not significant, which is the desired result for an
+excess-return model: it indicates Micron earns no reliable daily return beyond what
+its factor exposures explain — no "free lunch" left unaccounted for by the model.
+
+### C. R-squared
+
+The R-squared value is **`r fmt(s$r.squared, 3)`**, which means the model explains
+approximately **`r round(100 * s$r.squared)`%** of the day-to-day variation in
+Micron's excess return. In other words, roughly that share of Micron's daily moves
+is *systematic* — traceable to broad market, style, sector, and macro forces —
+while the remaining **`r round(100 * (1 - s$r.squared))`%** is **idiosyncratic**:
+specific to Micron (memory-pricing news, earnings, guidance, supply decisions) and
+not captured by these factors.
+
+### D. Adjusted R-squared
+
+The adjusted R-squared is **`r fmt(s$adj.r.squared, 3)`**. Adjusted R-squared
+penalizes the model for each additional predictor, so it rises only when a new
+variable adds explanatory power beyond what its degrees of freedom cost. Here it is
+almost identical to the ordinary R-squared (`r fmt(s$r.squared, 3)`), indicating that
+the predictor count is not inflating the fit. This is a statement about the set of
+predictors as a whole, not about each one individually: with `r n_obs` observations,
+one predictor costs a negligible fraction of a degree of freedom, so a flat adjusted
+R-squared is consistent with two of the seven predictors — the credit spread and the
+change in the VIX — being statistically insignificant. The overall fit is not an
+artifact of model size, but not every predictor contributes detectable independent
+explanatory power.
+
+## Residual Errors and Model Fit
+
+A **residual** is the difference between the actual value and the model's
+prediction:
+
+$$\text{Residual} = \text{Actual} - \text{Predicted}$$
+
+A residual tells us how far off the model was on a single day. A **positive**
+residual means the model **underpredicted** (Micron did better than expected); a
+**negative** residual means it **overpredicted** (Micron did worse than expected).
+For example, if Micron's actual excess return on a day was 3% and the model
+predicted 2%, the residual is +1%.
+
+## Residual Plot
+
+```{r resid-plot}
+#| fig-cap: "Residuals versus fitted values. A random horizontal band around zero indicates a well-behaved linear model."
+model_df$predicted <- fitted(model)
+model_df$residuals <- residuals(model)
+
+ggplot(model_df, aes(x = predicted, y = residuals)) +
+  geom_point(alpha = 0.25, color = "#2c7fb8") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(se = FALSE, color = "#d95f02", linewidth = 0.7) +
+  labs(title = "Residuals vs. Predicted Values (Micron excess return)",
+       x = "Predicted excess return", y = "Residual") +
+  theme_minimal()
+```
+
+```{r diagnostic-plots}
+#| fig-cap: "Standard regression diagnostics: residuals vs fitted, Normal Q-Q, scale-location, and residuals vs leverage."
+par(mfrow = c(2, 2)); plot(model); par(mfrow = c(1, 1))
+```
+
+The residuals are scattered fairly evenly above and below zero with no obvious
+trend across the range of predictions, so the orange smoother stays close to the
+dashed zero line — the **linearity** assumption looks reasonable. The visible
+feature is that the *spread* of the residuals widens on high-volatility days:
+large surprises cluster together, a familiar property of stock returns and an
+especially pronounced one for a cyclical memory name whose earnings days produce
+outsized moves. The model does not systematically over- or under-predict in any
+region; its errors are roughly centered on zero everywhere, but it is least
+precise during turbulent market periods. The Q-Q plot shows heavier tails than a
+normal distribution — extreme days (large jumps) happen more often than a bell
+curve would predict.
+
+## Model Assumptions and Limitations
+
+```{r diagnostics}
+vif_vals <- car::vif(model)
+bp <- lmtest::bptest(model)
+dw_lag1 <- cor(head(residuals(model), -1), tail(residuals(model), -1))
+```
+
+- **Linearity.** The residual plot shows no strong curvature, so a straight-line
+  relationship between the factors and Micron's return is a defensible
+  approximation.
+- **Residual randomness / independence.** The day-to-day autocorrelation of the
+  residuals is only about `r fmt(dw_lag1, 3)`, essentially zero, so the model is
+  not leaving obvious predictable structure in its errors.
+- **Outliers.** Extreme trading days (earnings surprises, market shocks) appear in
+  the tails of the Q-Q plot. They do not dominate the fit given the large sample,
+  but they are the days the model predicts least well.
+- **Multicollinearity.** All variance-inflation factors are low (the largest is
+  about `r fmt(max(vif_vals), 1)`, well under the usual threshold of 5), so the
+  predictors are not redundant and each coefficient is estimated on its own
+  distinct information.
+- **Constant error variance.** A Breusch–Pagan test rejects constant variance
+  (p `r ifelse(bp$p.value < 0.001, "< 0.001", paste("=", fmt(bp$p.value, 3)))`):
+  the model's errors are larger on volatile days. This **heteroskedasticity** does
+  not bias the coefficients, but it means the reported standard errors slightly
+  overstate the precision of the estimates. The large significances here are wide
+  enough that this caveat does not change which factors matter.
+- **Causation.** This model shows **association, not causation**. A significant
+  coefficient means a factor *moves together with* Micron's return, not that it
+  *causes* it. These factors and Micron are all driven by the same underlying
+  market forces in real time.
+
+## Has the AI Era Changed Micron's Character?
+
+The model above estimates a single set of factor loadings over the entire sample,
+which is valid only if those loadings are stable through time. Micron is a memory
+producer, and large-scale AI computing — a major new source of demand for
+high-bandwidth memory (HBM) — is a plausible reason for its loadings to have
+shifted. If they did, a full-sample regression reports an average across two
+distinct regimes and fits each one less well than a regime-specific model would.
+This section tests loading stability, locates any break date from the data,
+and quantifies what changed.
+
+### An AI-demand factor
+
+Exposure to AI computing demand enters as a daily signal through NVIDIA's return,
+which serves as a bellwether for data-center AI spending — the same spending that
+drives HBM demand at Micron. Much of NVIDIA's daily move is already captured by the
+market and semiconductor factors, so the raw return would be collinear with them.
+The **AI** factor is therefore the residual of NVIDIA's return after regressing it
+on the market and sector factors: the orthogonal component that those two factors
+do not explain. This isolates the incremental AI-demand signal and keeps it
+distinct from the existing predictors.
+
+```{r ai-factor}
+#| include: false
+brk_df <- model_df |> arrange(date)
+# Orthogonalize NVIDIA against the market and sector so AI carries only the
+# incremental AI-demand signal not already in those factors.
+brk_df$AI <- residuals(lm(NVDA_ret ~ Market + Sector, data = brk_df))
+
+base_form <- MU_excess ~ Market + Size + Value + Sector +
+  TermSpread + CreditSpread + Volatility
+ai_form   <- update(base_form, . ~ . + AI)
+```
+
+### Detecting the break
+
+The break date is estimated from the data rather than fixed in advance, since
+choosing it by inspection would bias any test evaluated at that point. The **supF
+(Quandt–Andrews) test** computes a Chow break statistic at every candidate date in
+the interior of the sample, takes the maximum, and compares it against a critical
+value adjusted for having searched over all dates. It tests the null of stable
+coefficients against a single unknown break and, if rejected, identifies the most
+likely break date.
+
+```{r supf-test}
+fs   <- strucchange::Fstats(ai_form, data = brk_df, from = 0.15)
+supf <- strucchange::sctest(fs)
+brk_date <- brk_df$date[fs$breakpoint]
+
+bp_obj <- strucchange::breakpoints(ai_form, data = brk_df, h = 0.15)
+n_breaks <- sum(!is.na(bp_obj$breakpoints))
+```
+
+The supF statistic is **`r fmt(as.numeric(supf$statistic), 1)`** with a p-value of
+**`r ifelse(supf$p.value < 0.001, "< 0.001", fmt(supf$p.value, 3))`**, rejecting
+coefficient stability at any conventional level. The estimated break date is
+**`r format(brk_date)`**. A Bai–Perron procedure that allows for multiple breaks
+selects **`r n_breaks`** as the optimal number, at the same date, so the evidence
+points to a single regime change rather than gradual drift.
+
+### Why that date
+
+The estimated break falls in **March 2024**, the quarter in which Micron's guidance
+shifted to HBM capacity selling out and AI data-center demand as the primary driver
+of its business. This coincides with the market's re-rating of Micron from a
+cyclical commodity-memory producer toward an AI-memory name. The break therefore
+corresponds to a datable change in the company's business rather than a purely
+statistical artifact. The chart below shows Micron's rolling factor loadings over
+the sample, with relevant AI milestones marked.
+
+```{r rolling-betas}
+#| fig-cap: "Rolling 126-trading-day factor loadings for Micron. Vertical lines mark AI milestones; the dashed line is the statistically detected break."
+#| fig-width: 7.5
+#| fig-height: 4
+win <- 126L
+roll_betas <- function(i) {
+  idx <- (i - win + 1):i
+  cf <- coef(lm(MU_excess ~ Market + Sector + AI, data = brk_df[idx, ]))
+  c(Market = cf["Market"], Sector = cf["Sector"], AI = cf["AI"])
+}
+roll <- t(vapply(win:nrow(brk_df), roll_betas, numeric(3)))
+roll_df <- tibble::tibble(
+  date   = brk_df$date[win:nrow(brk_df)],
+  Market = roll[, 1], Sector = roll[, 2], AI = roll[, 3]
+) |>
+  tidyr::pivot_longer(-date, names_to = "Factor", values_to = "Beta")
+
+milestones <- tibble::tibble(
+  date  = as.Date(c("2022-11-30", "2024-03-20")),
+  label = c("ChatGPT", "MU HBM / AI guidance")
+)
+
+ggplot(roll_df, aes(date, Beta, color = Factor)) +
+  geom_hline(yintercept = 0, color = "grey80") +
+  geom_vline(xintercept = brk_date, linetype = "dashed", color = "grey40") +
+  geom_vline(data = milestones, aes(xintercept = date),
+             linetype = "dotted", color = "grey55") +
+  geom_text(data = milestones, aes(x = date, y = Inf, label = label),
+            inherit.aes = FALSE, angle = 90, vjust = -0.3, hjust = 1,
+            size = 2.7, color = "grey45") +
+  geom_line(linewidth = 0.7) +
+  scale_color_manual(values = c(Market = "#1b9e77", Sector = "#7570b3",
+                                AI = "#d95f02")) +
+  labs(title = "Micron's factor loadings drifted as the AI era arrived",
+       x = NULL, y = "Rolling beta (126-day window)") +
+  theme_minimal() +
+  theme(plot.margin = margin(t = 18, r = 8, b = 4, l = 4))
+```
+
+The rolling loadings show Micron's sensitivity to the broad market and the chip
+sector rising over the sample, with the AI-demand loading increasing distinctly
+around the estimated break.
+
+### What changed, and by how much
+
+To quantify the shift, we fit a single model over the full sample with a **Post**
+indicator (one from the break date onward) interacted with the factors most likely
+to have moved. Each interaction coefficient is the *change* in that loading after
+the break. Because the residuals are heteroskedastic, the coefficients are tested
+with heteroskedasticity-robust (HC1) standard errors.
+
+```{r interaction-model}
+brk_df$Post <- as.integer(brk_df$date >= brk_date)
+inter <- lm(MU_excess ~ (Market + Sector + Value + AI) * Post +
+              Size + TermSpread + CreditSpread + Volatility, data = brk_df)
+
+robust_se <- lmtest::coeftest(inter, vcov. = sandwich::vcovHC(inter, type = "HC1"))
+broom::tidy(robust_se) |>
+  filter(grepl(":Post$", term) | term == "AI") |>
+  mutate(across(where(is.numeric), \(x) round(x, 4))) |>
+  kable(caption = "Post-break changes in Micron's factor loadings (robust standard errors). A significant interaction means the loading shifted after the AI-era break.")
+```
+
+```{r subsample-table}
+periods <- lapply(c(0, 1), function(p) {
+  d  <- brk_df[brk_df$Post == p, ]
+  m  <- lm(base_form, data = d)
+  ma <- lm(ai_form,  data = d)
+  tibble::tibble(
+    Period   = if (p == 0) "Pre-break" else "Post-break",
+    N        = nrow(d),
+    `Market beta` = round(coef(m)["Market"], 3),
+    `Sector beta` = round(coef(m)["Sector"], 3),
+    `AI beta`     = round(coef(ma)["AI"], 3),
+    `R-squared`   = round(summary(m)$r.squared, 3)
+  )
+})
+ai_pre  <- periods[[1]]$`AI beta`; ai_post <- periods[[2]]$`AI beta`
+mkt_pre <- periods[[1]]$`Market beta`; mkt_post <- periods[[2]]$`Market beta`
+sec_pre <- periods[[1]]$`Sector beta`; sec_post <- periods[[2]]$`Sector beta`
+r2_pre  <- periods[[1]]$`R-squared`;   r2_post  <- periods[[2]]$`R-squared`
+
+# Raw-return volatility and tail-frequency, by regime, to characterize the
+# change in how violently Micron trades (annualized from daily returns).
+mu_raw <- prices_wide |> arrange(date) |>
+  transmute(date, MU = MU / dplyr::lag(MU) - 1) |>
+  tidyr::drop_na() |>
+  dplyr::semi_join(brk_df, by = "date") |>
+  dplyr::mutate(Post = as.integer(date >= brk_date))
+vol_pre   <- sd(mu_raw$MU[mu_raw$Post == 0]) * sqrt(252) * 100
+vol_post  <- sd(mu_raw$MU[mu_raw$Post == 1]) * sqrt(252) * 100
+big_pre   <- mean(abs(mu_raw$MU[mu_raw$Post == 0]) > 0.05) * 100
+big_post  <- mean(abs(mu_raw$MU[mu_raw$Post == 1]) > 0.05) * 100
+
+dplyr::bind_rows(periods) |>
+  kable(caption = "Micron's factor loadings and fit, estimated separately before and after the detected break.")
+```
+
+Among the interacted loadings, only the **AI-demand factor shows a statistically
+significant change** at the break. Micron's loading on the orthogonal AI signal
+roughly doubles, from `r fmt(ai_pre, 2)` before the break to `r fmt(ai_post, 2)`
+after, and the change remains significant under heteroskedasticity-robust standard
+errors. The market and sector loadings also increase, but their shifts are not
+individually distinguishable from zero once the AI factor is included. The regime
+change is thus concentrated in Micron's sensitivity to AI computing demand rather
+than spread across its broad-market or sector exposures.
+
+The post-break R-squared is lower than the pre-break value. As Micron's returns
+became more tied to AI-specific developments, a larger share of its daily variation
+moved outside the span of the fixed factor set and into the idiosyncratic
+component. The stock both loaded more heavily on AI demand and became harder to
+explain with any constant set of factors.
+
+The regime change is also visible in the raw scale of Micron's moves (Table 5).
+Annualized return volatility rose from about **`r round(vol_pre)`%** before the break
+to **`r round(vol_post)`%** after, and the share of trading days with an absolute
+move larger than 5% rose from **`r fmt(big_pre, 1)`%** to **`r fmt(big_post, 1)`%** —
+roughly one day in six in the current regime. Micron did not merely re-rate to a
+higher loading on AI demand; it became a materially more volatile instrument, with
+double-digit single-day moves now a routine feature of how the market prices its
+exposure to AI capacity.
+
+```{r volatility-table}
+tibble::tibble(
+  Period = c("Pre-break", "Post-break"),
+  `Annualized volatility` = sprintf("%.0f%%", c(vol_pre, vol_post)),
+  `Days with >5% move`    = sprintf("%.1f%%", c(big_pre, big_post))
+) |>
+  kable(caption = "Raw-return volatility and large-move frequency, before and after the detected break.")
+```
+
+Taken together, the results give a specific characterization of the regime change:
+Micron's factor loadings were not stable across the sample, the instability is
+dated to March 2024 and aligns with a concrete shift in the company's business, and
+its principal manifestation is an approximately doubled sensitivity to AI computing
+demand. Treating the change this way — as a measurable shift in existing loadings
+plus one orthogonal demand factor — keeps each component identified and avoids
+attributing the move to a single undated event.
+
+## The "So What?"
+
+The full-sample model answers the question it was built to answer — over the whole
+period, the **semiconductor sector** is Micron's dominant exposure and its market
+beta sits modestly above one — but those coefficients average across two distinct
+regimes, and the structural-break analysis shows the average understates what
+Micron has become. The relevant description of the stock today is the post-2024
+regime, not the blended average.
+
+In the current regime, Micron is a substantially more aggressive instrument. Its
+market beta is about **`r fmt(mkt_post, 2)`** (versus `r fmt(mkt_pre, 2)` before the
+break), its semiconductor-sector loading is **`r fmt(sec_post, 2)`**, and its loading
+on the orthogonal AI-demand factor has roughly doubled to **`r fmt(ai_post, 2)`**.
+The market now prices Micron heavily as a proxy for AI-memory buildout: it amplifies
+both the broad market and the chip sector, and it responds directly to swings in
+AI-demand sentiment. Notably, the systematic share of its variation *fell* even as
+these loadings rose — the model's R-squared drops from **`r fmt(r2_pre, 2)`** before
+the break to **`r fmt(r2_post, 2)`** after — so Micron became both more AI-levered
+and more idiosyncratic, with a larger fraction of its daily moves now driven by
+AI- and company-specific news no fixed factor set can capture. That shift comes with
+far larger moves — annualized volatility near **`r round(vol_post)`%** and an
+absolute daily move above 5% on roughly **`r fmt(big_post, 1)`%** of trading days,
+including frequent double-digit single-session swings.
+
+For an investor, the practical implications follow from the current regime, not the
+historical average. Micron today is close to a leveraged, high-volatility bet on the
+semiconductor sector and the AI-memory cycle: an investor holding the chip sector
+already carries much of its systematic risk, but in amplified form, and with sizable
+AI-sentiment exposure on top. Its risk is no longer that of a "mildly high-beta"
+name — it is a stock that routinely moves several percent in a day and is repriced
+sharply on AI-demand news. Three caveats bound the analysis: it measures
+association, not causation; its errors are largest on the most volatile days; and,
+most importantly here, its loadings are regime-dependent — the March 2024 break is
+direct evidence that they can shift again as the AI cycle evolves. Like any factor
+model, it explains the *systematic* part of Micron's returns rather than predicting
+any single day's move, since a large idiosyncratic share remains by construction.
+Within that scope it does its job: it identifies which forces drive Micron,
+quantifies how strongly each one does, shows that those relationships shifted in
+March 2024, and delivers a clear, current picture of what the stock is exposed to
+and how violently it now trades.

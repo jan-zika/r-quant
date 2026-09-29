@@ -11,6 +11,16 @@
 # Secrets / local environment
 .Renviron
 
+# Local data cache - never synced to git (re-fetchable from the source APIs).
+# Everything under data/cache/ is disposable.
+data/cache/
+*.partial
+
+# Quarto
+/.quarto/
+**/*_files/
+**/*_cache/
+
 # renv
 renv/library/
 renv/staging/

@@ -1,0 +1,59 @@
+# Market-data symbol universe and configuration.
+# Single source of truth for the data pipeline (R/config.R reads this).
+
+# Earliest date to fetch for any symbol on a full refresh.
+start_date: "2019-01-01"
+
+# FRED series fetched as macro predictors / risk-free rate for the regression lab.
+#   DTB3     3-Month Treasury Bill rate (risk-free rate)
+#   T10Y3M   10-Year minus 3-Month Treasury term spread (yield-curve slope)
+#   BAA10Y   Moody's Baa corporate yield minus 10-Year Treasury (credit spread)
+#   VIXCLS   CBOE Volatility Index (VIX)
+# (ICE BofA OAS series are only licensed back ~2 years on this API tier, so the
+#  full-history BAA10Y credit spread and the ready-made T10Y3M slope are used.)
+macro_series:
+  - DTB3
+  - T10Y3M
+  - BAA10Y
+  - VIXCLS
+
+# Full symbol universe, tagged by group.
+symbols:
+  # --- Broad-market / style-factor ETFs ---
+  - symbol: VTI
+    name: "Vanguard Total Stock Market ETF"
+    group: broad_etf
+  - symbol: SPY
+    name: "SPDR S&P 500 ETF Trust"
+    group: broad_etf
+  - symbol: IWM
+    name: "iShares Russell 2000 ETF"            # small-cap (size factor)
+    group: size_etf
+  - symbol: IWD
+    name: "iShares Russell 1000 Value ETF"      # value leg
+    group: style_etf
+  - symbol: IWF
+    name: "iShares Russell 1000 Growth ETF"     # growth leg
+    group: style_etf
+
+  # --- Sector ETFs (sector-tilt factor) ---
+  - symbol: XLK
+    name: "Technology Select Sector SPDR Fund"
+    group: sector_etf
+  - symbol: XSD
+    name: "SPDR S&P Semiconductor ETF"
+    group: sector_etf
+
+  # --- Candidate target stocks (regression outcome) ---
+  - symbol: NVDA
+    name: "NVIDIA Corporation"
+    group: stock
+  - symbol: MU
+    name: "Micron Technology, Inc."
+    group: stock
+  - symbol: TSLA
+    name: "Tesla, Inc."
+    group: stock
+  - symbol: AAPL
+    name: "Apple Inc."
+    group: stock
